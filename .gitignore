@@ -1,0 +1,25 @@
+# Secrets - never in git (VibeCode rule 9)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Terraform
+.terraform/
+.terraform.lock.hcl.bak
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+backend.hcl
+crash.log
+crash.*.log
+
+# Local docker overrides
+docker-compose.override.yml
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+*.swp

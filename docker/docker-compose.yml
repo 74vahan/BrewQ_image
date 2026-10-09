@@ -1,0 +1,95 @@
+# BrewQ: MySQL + backend (FastAPI). nginx NOT here: on the server it runs on the
+# host (Terraform, BrewQ_image/terraform), and the barista panel is static files
+# on disk (/srv/brewq/web/current).
+#
+# Local run (from the BrewQ_image root; --env-file is mandatory because the
+# project directory is docker/, not the repo root):
+#   docker compose -p brewq-dev --env-file .env \
+#     -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up -d --build
+#
+# Server run (done by the BrewQ_infra deploy, see memory/01-docker.md):
+#   BACKEND_CONTEXT=/srv/brewq/app/backend docker compose -p brewq \
+#     --env-file /srv/brewq/.env -f /srv/brewq/app/docker/docker-compose.yml up -d --build
+name: brewq
+
+services:
+  db:
+    image: mysql:8.4
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:?MYSQL_DATABASE is required (set it in .env)}
+      MYSQL_USER: ${MYSQL_USER:?MYSQL_USER is required (set it in .env)}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD is required (set it in .env)}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required (set it in .env)}
+      TZ: UTC
+    volumes:
+      - brewq-db-data:/var/lib/mysql
+    # No `ports:` on purpose: only the api service talks to MySQL, inside the
+    # compose network. The dev overlay publishes it on 127.0.0.1:53306.
+    healthcheck:
+      # TCP on 127.0.0.1: the image's temporary init server listens on the
+      # unix socket only, so this turns healthy only once the real server is up.
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  api:
+    image: brewq-api
+    build:
+      # The backend Dockerfile lives HERE, the code lives in BrewQ_infra, and
+      # Compose resolves `dockerfile` relative to the build context, which
+      # differs between a laptop, CI and the server. So the context is this
+      # directory and the backend directory is a named context: the Dockerfile
+      # reads it with `COPY --from=backend`. BACKEND_CONTEXT stays the single
+      # knob (repository contract).
+      context: .
+      dockerfile: backend.Dockerfile
+      additional_contexts:
+        backend: ${BACKEND_CONTEXT:-../../BrewQ_infra/app/backend}
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@db:3306/${MYSQL_DATABASE}?charset=utf8mb4
+      BARISTA_PASSWORD: ${BARISTA_PASSWORD:?BARISTA_PASSWORD is required (set it in .env)}
+      BARISTA_TOKEN_SECRET: ${BARISTA_TOKEN_SECRET:?BARISTA_TOKEN_SECRET is required (set it in .env)}
+      BARISTA_TOKEN_TTL_HOURS: ${BARISTA_TOKEN_TTL_HOURS:-12}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MIGRATE_ON_START: "true"
+      SEED_ON_START: "true"
+      TZ: UTC
+    depends_on:
+      db:
+        condition: service_healthy
+    # Loopback only: the host nginx faces the internet and proxies to
+    # 127.0.0.1:8081. Binding 0.0.0.0 would publish the API past nginx.
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8081}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # Migrations and the menu seed run before uvicorn starts.
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  brewq-db-data:

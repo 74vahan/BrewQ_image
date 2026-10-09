@@ -1,0 +1,5 @@
+# BuildKit applies this file to the main build context (this docker/ directory).
+# The backend context (named `backend`) is filtered by the Dockerfile's selective
+# COPY lines and by a .dockerignore inside the backend directory, if it has one.
+docker-compose*.yml
+*.dockerignore

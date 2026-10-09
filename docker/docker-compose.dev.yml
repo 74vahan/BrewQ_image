@@ -1,0 +1,25 @@
+# Local development overlay (on top of docker-compose.yml):
+#   docker compose -p brewq-dev --env-file .env \
+#     -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up -d --build
+services:
+  db:
+    # 53306, not 3306: do not clash with a MySQL installed on the machine.
+    # Backend tests (pytest) reach the database here. Loopback only.
+    ports:
+      - "127.0.0.1:53306:3306"
+
+  api:
+    environment:
+      SERVE_MEDIA: "true"
+      MEDIA_DIR: /media
+    # Menu images are served by the app itself (nginx does it on the server).
+    # Source is mounted read-only: uvicorn --reload restarts on an edit, and the
+    # container can never write back into the working tree. No --workers here:
+    # it is incompatible with --reload.
+    command:
+      - sh
+      - -c
+      - python -m app.boot && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /srv/api/app
+    volumes:
+      - ${MEDIA_DIR_HOST:-../../BrewQ_infra/app/media}:/media:ro
+      - ${BACKEND_CONTEXT:-../../BrewQ_infra/app/backend}/app:/srv/api/app:ro

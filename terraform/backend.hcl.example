@@ -1,0 +1,5 @@
+# Remote state in GCS (recommended: the state holds the private key and passwords).
+# 1. Uncomment backend "gcs" {} in versions.tf
+# 2. terraform init -backend-config=backend.hcl
+bucket = "my-terraform-state-bucket"
+prefix = "brewq/server"

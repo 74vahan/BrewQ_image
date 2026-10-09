@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# VM startup script: rendered by Terraform and run by GCP as root on boot.
+#
+# It prepares the host so that everything that comes later just works:
+#   * Docker (official apt repository), for the db + api stack that
+#     BrewQ_infra deploys;
+#   * nginx on the host, the single front door (its config comes from nginx.tf);
+#   * certbot and the ACME webroot, so a certificate can be issued before the
+#     first deploy ever happens;
+#   * the directory layout both repositories agree on, with a placeholder panel
+#     already in place - nginx must have something to serve on day one.
+#
+# GCP runs startup scripts on every boot, so everything here is idempotent and
+# a finished bootstrap exits immediately.
+#
+# Shell variables are written as "$NAME" without braces on purpose: this file
+# goes through templatefile(), where a dollar followed by a brace is Terraform's
+# own syntax.
+set -euo pipefail
+
+APP_USER="${ssh_user}"
+APP_ROOT="${app_root}"
+LOG=/var/log/brewq-bootstrap.log
+exec > >(tee -a "$LOG") 2>&1
+
+if [ -f "$APP_ROOT/.bootstrap-done" ]; then
+  echo "[bootstrap] already done, nothing to do"
+  exit 0
+fi
+
+echo "[bootstrap] start $(date -Is)"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y ca-certificates curl gnupg ufw fail2ban nginx certbot rsync
+
+# ---------------------------------------------------------------- Deploy user
+# The GCP guest agent creates this user from the ssh-keys metadata too; making
+# sure it exists first keeps the ownership steps below from racing with it.
+if ! id -u "$APP_USER" >/dev/null 2>&1; then
+  useradd --create-home --shell /bin/bash "$APP_USER"
+fi
+
+# ---------------------------------------------------------------- Docker
+if ! command -v docker >/dev/null 2>&1; then
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
+  apt-get update -y
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+fi
+usermod -aG docker "$APP_USER"
+systemctl enable --now docker
+
+# ---------------------------------------------------------------- Firewall
+# Cloud firewall rules are the primary control; ufw is defense in depth.
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw --force enable
+
+systemctl enable --now fail2ban
+
+# ---------------------------------------------------------------- SSH hardening
+# A drop-in sorts before the cloud image's own 60-cloudimg-settings.conf, and
+# sshd keeps the first value it reads for each option.
+cat > /etc/ssh/sshd_config.d/10-brewq-hardening.conf <<'SSHD'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+SSHD
+sshd -t
+systemctl reload ssh || systemctl reload sshd || true
+
+# ---------------------------------------------------------------- Layout
+# Owned by the deploy user, so deploys need no sudo at all.
+install -d -o "$APP_USER" -g "$APP_USER" -m 0755 "$APP_ROOT"
+install -d -o "$APP_USER" -g "$APP_USER" -m 0755 "${app_dir}"
+install -d -o "$APP_USER" -g "$APP_USER" -m 0755 "${web_dir}/releases/bootstrap"
+install -d -m 0755 /var/www/certbot
+
+# A placeholder release, so nginx starts and the ACME challenge succeeds long
+# before the pipeline publishes the real panel. The first deploy replaces the
+# symlink with its own release and this directory stops being used.
+# The stylesheet is a separate file: the Content-Security-Policy that nginx
+# sends (default-src 'self') blocks inline <style>.
+if [ ! -e "${web_root}" ]; then
+  cat > "${web_dir}/releases/bootstrap/placeholder.css" <<'CSS'
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: #3b2418;
+  color: #f4e6d4;
+  text-align: center;
+  font-family: Georgia, "Times New Roman", serif;
+}
+h1 {
+  margin: 0 0 1rem;
+  font-size: clamp(2.5rem, 12vw, 5rem);
+  letter-spacing: 0.02em;
+}
+p {
+  margin: 0.4rem 0;
+  opacity: 0.85;
+}
+CSS
+  cat > "${web_dir}/releases/bootstrap/index.html" <<'HTML'
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>BrewQ</title>
+    <link rel="stylesheet" href="/placeholder.css" />
+  </head>
+  <body>
+    <main>
+      <h1>BrewQ</h1>
+      <p>BrewQ will open soon.</p>
+      <p>BrewQ скоро откроется.</p>
+      <p>BrewQ-ը շուտով կբացվի։</p>
+    </main>
+  </body>
+</html>
+HTML
+  chown -R "$APP_USER":"$APP_USER" "${web_dir}/releases/bootstrap"
+  ln -sfn "${web_dir}/releases/bootstrap" "${web_dir}/current.tmp"
+  mv -Tf "${web_dir}/current.tmp" "${web_root}"
+  chown -h "$APP_USER":"$APP_USER" "${web_root}"
+fi
+
+# ---------------------------------------------------------------- .env
+# Written once and then preserved forever: rotating these silently would leave
+# the database volume on the old password and sign every barista out.
+# The deploy refuses to run if this file is missing - it never writes it.
+# The quoted heredoc keeps the shell from touching the values.
+if [ ! -f "${env_file}" ]; then
+  umask 077
+  cat > "${env_file}" <<'ENV'
+MYSQL_DATABASE=${mysql_database}
+MYSQL_USER=${mysql_user}
+MYSQL_PASSWORD=${mysql_password}
+MYSQL_ROOT_PASSWORD=${mysql_root_password}
+BARISTA_PASSWORD=${barista_password}
+BARISTA_TOKEN_SECRET=${barista_token_secret}
+BARISTA_TOKEN_TTL_HOURS=${barista_token_ttl_hours}
+BACKEND_PORT=${backend_port}
+PUBLIC_BASE_URL=${site_origin}
+LOG_LEVEL=INFO
+ENV
+  umask 022
+  chown "$APP_USER":"$APP_USER" "${env_file}"
+  chmod 600 "${env_file}"
+fi
+
+# ---------------------------------------------------------------- nginx
+# The real site config arrives from nginx.tf in the same apply; here we only
+# make sure the stock "Welcome to nginx" page is not what visitors would see.
+rm -f /etc/nginx/sites-enabled/default
+systemctl enable --now nginx
+
+# ---------------------------------------------------------------- Housekeeping
+# Keep the disk from filling up with old images and build cache.
+cat > /etc/cron.weekly/docker-prune <<'CRON'
+#!/bin/sh
+docker system prune -af --filter "until=168h" >/dev/null 2>&1 || true
+CRON
+chmod +x /etc/cron.weekly/docker-prune
+
+touch "$APP_ROOT/.bootstrap-done"
+chown "$APP_USER":"$APP_USER" "$APP_ROOT/.bootstrap-done"
+echo "[bootstrap] done $(date -Is)"

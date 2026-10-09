@@ -1,0 +1,149 @@
+# /etc/nginx/sites-available/brewq
+#
+# Managed by Terraform (BrewQ_image, nginx.tf). Any edit made on the server is
+# overwritten by the next `terraform apply` - change the template instead.
+#
+# nginx runs on the host, not in Docker: it owns the certificate, the media
+# files and the static panel on disk, none of which belong to the application
+# image that BrewQ_infra deploys.
+
+# Per-IP rate limits. The panel itself is static and not limited.
+#   api   - everything under /api/ (also stops mass creation of customers
+#           through random X-Device-Id values);
+#   login - the barista login, a password-guessing target.
+limit_req_zone $binary_remote_addr zone=brewq_api:10m rate=10r/s;
+limit_req_zone $binary_remote_addr zone=brewq_login:10m rate=5r/m;
+
+%{ if tls ~}
+# Plain HTTP exists only to renew the certificate and to send people to HTTPS.
+server {
+    listen      80;
+    listen      [::]:80;
+    server_name ${server_name};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen      443 ssl http2;
+    listen      [::]:443 ssl http2;
+    server_name ${server_name};
+
+    ssl_certificate     ${cert_dir}/fullchain.pem;
+    ssl_certificate_key ${cert_dir}/privkey.pem;
+
+    ssl_protocols             TLSv1.2 TLSv1.3;
+    ssl_ciphers               ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache         shared:SSL:10m;
+    ssl_session_timeout       1d;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+%{ else ~}
+# No domain yet: the site answers on the server's IP over plain HTTP.
+# Fine for tests, not for the barista password.
+server {
+    listen      80 default_server;
+    listen      [::]:80 default_server;
+    server_name ${server_name};
+%{ endif ~}
+
+    server_tokens off;
+
+    root  ${web_root};
+    index index.html;
+
+    # There are no uploads anywhere in the API.
+    client_max_body_size 16k;
+
+    # Too many requests get the same JSON envelope as every other API error.
+    limit_req_status 429;
+    error_page 429 = @rate_limited;
+
+    # Security headers, set once at server level. The locations below use
+    # `expires` rather than `add_header Cache-Control`, because a single
+    # add_header inside a location drops every header inherited from here.
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+    add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; media-src 'self'; frame-ancestors 'none'; base-uri 'self'" always;
+
+    # Proxy settings shared by the three API locations below. A location that
+    # sets no proxy_set_header of its own inherits all of them.
+    proxy_http_version 1.1;
+    proxy_set_header Connection        "";
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_connect_timeout 5s;
+    proxy_read_timeout    30s;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # Health checks stay unthrottled and out of the access log, so monitoring
+    # never trips the limiter.
+    location = /api/health {
+        proxy_pass http://127.0.0.1:${backend_port};
+        access_log off;
+    }
+
+    # Stricter than the rest of the API: the shared barista password is the one
+    # secret that can be guessed over the network.
+    location = /api/barista/login {
+        limit_req zone=brewq_login burst=5 nodelay;
+        proxy_pass http://127.0.0.1:${backend_port};
+    }
+
+    # The API. `^~` makes this prefix win over the regex location for static
+    # files below: without it /api/x.png would be looked up on disk. The block
+    # also has to win over the SPA fallback, otherwise /api/* quietly starts
+    # answering with index.html and every client breaks in a way that looks like
+    # a backend outage.
+    location ^~ /api/ {
+        limit_req zone=brewq_api burst=20 nodelay;
+        proxy_pass http://127.0.0.1:${backend_port};
+    }
+
+    # Menu pictures: plain files in the application directory that each deploy
+    # replaces. `^~` for the same reason as above - /media/menu/latte.webp must
+    # not fall into the static-file regex, which serves from the panel root.
+    location ^~ /media/ {
+        alias ${media_dir}/;
+        expires 7d;
+    }
+
+    # Vite hashes asset file names, so they can be cached for a long time.
+    location ~* \.(?:css|js|mjs|woff2|svg|png|webp|ico|mp3)$ {
+        expires 30d;
+    }
+
+    # The entry point must not be cached: it is what points at the new hashes.
+    location = /index.html {
+        expires -1;
+    }
+
+    # Client-side routing: paths like /today have no file behind them.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location @rate_limited {
+        default_type application/json;
+        return 429 '{"error":{"code":"RATE_LIMITED","message":"Too many requests","details":{}}}';
+    }
+
+    gzip              on;
+    gzip_min_length   1024;
+    gzip_proxied      any;
+    gzip_types        text/plain text/css application/json application/javascript image/svg+xml;
+}

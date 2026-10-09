@@ -1,0 +1,5 @@
+# Scripts and templates go to Linux: no CRLF, even if git on Windows is
+# configured with autocrlf.
+*.sh      text eol=lf
+*.tftpl   text eol=lf
+*.tf      text eol=lf

@@ -1,0 +1,35 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is not tracked by git.
+
+# Required: Google Cloud project ID (billing must be enabled).
+project_id = "my-gcp-project-id"
+
+# Optional - defaults are already set:
+# region        = "europe-west3"
+# zone          = "europe-west3-c"
+# instance_name = "brewq-server"
+# machine_type  = "e2-small"
+# disk_size_gb  = 20
+
+# Contract with BrewQ_infra. Change only together with the CI in that repository:
+# ssh_user     = "brewq"       # secret SERVER_USER
+# app_root     = "/srv/brewq"  # variable APP_ROOT
+# backend_port = 8081          # BACKEND_PORT in docker-compose.yml
+
+# Domain and HTTPS. While empty, the site works over HTTP on the IP (for tests
+# only: the barista password travels in plain text) and no certificate is issued.
+# The domain's A record must already point to external_ip, otherwise certbot fails.
+# domain         = "brewq.example.com"
+# domain_aliases = ["www.brewq.example.com"]
+# certbot_email  = "you@example.com"
+
+# Application secrets. Empty - Terraform generates random ones and writes them to
+# /srv/brewq/.env once (the values remain in the state file).
+# Allowed characters: A-Z a-z 0-9 _ . ~ -
+# mysql_password       = ""
+# mysql_root_password  = ""
+# barista_password     = ""   # at least 12 characters
+# barista_token_secret = ""   # at least 32 characters
+# barista_token_ttl_hours = 12
+
+# Hardening: once CI/CD is set up, SSH access can be narrowed.
+# ssh_source_ranges = ["1.2.3.4/32"]

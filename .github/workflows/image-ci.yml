@@ -1,0 +1,139 @@
+name: image-ci
+
+# Checks everything that can be checked without a cloud: Terraform format and
+# validity, nginx -t over the rendered configs, bash -n and shellcheck over the
+# scripts, docker compose config and (once BrewQ_infra has a backend) the image
+# build.
+#
+# There is intentionally no deploy or terraform apply here: the state holds the
+# private key and all passwords, so apply runs from a laptop, not from CI.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: 1.9.5
+
+jobs:
+  terraform:
+    name: terraform fmt / validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: fmt
+        run: terraform fmt -check -recursive -diff
+        working-directory: terraform
+
+      # -backend=false: the check needs neither state nor cloud credentials.
+      - name: init
+        run: terraform init -backend=false -input=false
+        working-directory: terraform
+
+      - name: validate
+        run: terraform validate -no-color
+        working-directory: terraform
+
+      - name: validate (template render module)
+        run: |
+          terraform -chdir=scripts/render init -backend=false -input=false
+          terraform -chdir=scripts/render validate -no-color
+        working-directory: terraform
+
+  templates:
+    name: nginx -t and bash -n over templates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      # On ubuntu-24.04 this is nginx 1.24 - the same branch as on the server.
+      - name: Install nginx
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y nginx-light
+
+      - name: Render templates and check the result
+        run: terraform/scripts/check-templates.sh
+        env:
+          REQUIRE_SHELLCHECK: "1"
+
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The rendered bootstrap is checked by the templates job: before
+      # templatefile() it is a template, not bash.
+      - name: shellcheck
+        run: shellcheck terraform/scripts/*.sh
+
+  compose:
+    name: docker compose
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Test values only for parsing the file and building: the real passwords
+      # live in /srv/brewq/.env on the server and never reach the repository.
+      - name: Test .env
+        run: |
+          {
+            echo "MYSQL_DATABASE=brewq"
+            echo "MYSQL_USER=brewq"
+            echo "MYSQL_PASSWORD=ci-mysql-password"
+            echo "MYSQL_ROOT_PASSWORD=ci-mysql-root-password"
+            echo "BARISTA_PASSWORD=ci-barista-password"
+            echo "BARISTA_TOKEN_SECRET=ci-barista-token-secret-0123456789abcdef"
+          } > "$RUNNER_TEMP/ci.env"
+
+      - name: compose config (base)
+        run: docker compose -p brewq --env-file "$RUNNER_TEMP/ci.env" -f docker/docker-compose.yml config -q
+
+      - name: compose config (base + dev)
+        run: docker compose -p brewq --env-file "$RUNNER_TEMP/ci.env" -f docker/docker-compose.yml -f docker/docker-compose.dev.yml config -q
+
+      # BrewQ_infra is public; if it is unavailable or has no backend yet, the
+      # build is skipped with a notice instead of failing CI.
+      - name: Checkout BrewQ_infra
+        id: infra
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: 74vahan/BrewQ_infra
+          ref: main
+          path: _infra
+
+      - name: Check for backend in BrewQ_infra
+        id: backend
+        run: |
+          if [ -f _infra/app/backend/requirements.txt ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::74vahan/BrewQ_infra@main has no app/backend/requirements.txt (or the repository is unavailable) - api image build skipped"
+          fi
+
+      - name: compose build api
+        if: steps.backend.outputs.present == 'true'
+        run: BACKEND_CONTEXT="$GITHUB_WORKSPACE/_infra/app/backend" docker compose -p brewq --env-file "$RUNNER_TEMP/ci.env" -f docker/docker-compose.yml build api
