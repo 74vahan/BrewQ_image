@@ -10,8 +10,14 @@
 .terraform.lock.hcl.bak
 *.tfstate
 *.tfstate.*
-terraform.tfvars
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
 backend.hcl
+# GCP service account keys, if ever downloaded instead of gcloud ADC
+*-sa.json
+*-sa-key.json
+credentials*.json
 crash.log
 crash.*.log
 
