@@ -29,9 +29,6 @@ to_mount_path() {
   if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi
 }
 
-# Paths inside the config must match the ones nginx will see:
-# for a container it is /work, for a local nginx it is the temp dir itself.
-
 # True if this process may bind to ports 80 and 443.
 can_bind_low_ports() {
   [ "$(id -u)" -eq 0 ] && return 0
@@ -40,6 +37,8 @@ can_bind_low_ports() {
   [ "$start" -le 80 ]
 }
 
+# Paths inside the config must match the ones nginx will see:
+# for a container it is /work, for a local nginx it is the temp dir itself.
 if command -v nginx >/dev/null 2>&1 && can_bind_low_ports; then
   RUNNER=native
   CONF_ROOT="$WORK"
@@ -51,9 +50,6 @@ elif command -v nginx >/dev/null 2>&1; then
   echo "  sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0" >&2
   echo "or start Docker (the check then runs in a container)." >&2
   exit 1
-elif docker info >/dev/null 2>&1; then
-  RUNNER=docker
-  CONF_ROOT=/work
 else
   echo "Need nginx in PATH or a running Docker - neither is available." >&2
   exit 1
