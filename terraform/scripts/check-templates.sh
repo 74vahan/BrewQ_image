@@ -9,6 +9,11 @@
 # Usage:  terraform/scripts/check-templates.sh
 # Needs nginx in PATH or a running Docker (image nginx:1.24-alpine - the same
 # branch as in Ubuntu 24.04 on the server).
+#
+# `nginx -t` really binds the listen sockets (80 and 443 here), so a local
+# (native) nginx needs either root or net.ipv4.ip_unprivileged_port_start <= 80.
+# CI sets the sysctl before running this script; on a laptop without it the
+# script falls back to Docker (root inside the container) or explains what to do.
 # REQUIRE_SHELLCHECK=1 - fail if shellcheck is unavailable (CI runs it this way).
 set -euo pipefail
 
@@ -26,9 +31,26 @@ to_mount_path() {
 
 # Paths inside the config must match the ones nginx will see:
 # for a container it is /work, for a local nginx it is the temp dir itself.
-if command -v nginx >/dev/null 2>&1; then
+
+# True if this process may bind to ports 80 and 443.
+can_bind_low_ports() {
+  [ "$(id -u)" -eq 0 ] && return 0
+  local start
+  start="$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null || echo 1024)"
+  [ "$start" -le 80 ]
+}
+
+if command -v nginx >/dev/null 2>&1 && can_bind_low_ports; then
   RUNNER=native
   CONF_ROOT="$WORK"
+elif docker info >/dev/null 2>&1; then
+  RUNNER=docker
+  CONF_ROOT=/work
+elif command -v nginx >/dev/null 2>&1; then
+  echo "nginx -t binds ports 80/443, and this user may not. Either run as root, or:" >&2
+  echo "  sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0" >&2
+  echo "or start Docker (the check then runs in a container)." >&2
+  exit 1
 elif docker info >/dev/null 2>&1; then
   RUNNER=docker
   CONF_ROOT=/work
@@ -92,7 +114,10 @@ CONF
 
   echo "==> nginx -t: $variant"
   if [ "$RUNNER" = native ]; then
-    nginx -t -p "$WORK/$variant" -c "$WORK/$variant/nginx.conf"
+    # -e: nginx opens a compiled-in default error log (/var/log/nginx/...)
+    # before it reads the config; a non-root user cannot, so point it at the
+    # temp dir.
+    nginx -t -p "$WORK/$variant" -c "$WORK/$variant/nginx.conf" -e "$WORK/$variant/logs/error.log"
   else
     MSYS_NO_PATHCONV=1 docker run --rm -v "$(to_mount_path "$WORK")":/work "$NGINX_IMAGE" \
       nginx -t -p "/work/$variant" -c "/work/$variant/nginx.conf"

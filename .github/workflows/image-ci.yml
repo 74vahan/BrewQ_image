@@ -72,6 +72,12 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y nginx-light
 
+      # `nginx -t` binds the listen sockets, and the runner user is not root:
+      # without this, ports 80/443 fail with "bind() ... (13: Permission denied)".
+      # Every check stays real - only the privileged-port restriction is lifted.
+      - name: Allow unprivileged binding to ports 80/443
+        run: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
+
       - name: Render templates and check the result
         run: terraform/scripts/check-templates.sh
         env:

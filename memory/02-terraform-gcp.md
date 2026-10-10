@@ -151,6 +151,14 @@ App Links (`assetlinks.json`) из Miasin **не переносятся** — в
   HTTPS) и гоняет `nginx -t` над каждым в `nginx:1.24-alpine` (или локальном
   nginx). Поведение (порядок location, лимит, медиа) дополнительно проверено
   в контейнере вручную 09.10.2026.
+- `nginx -t` реально биндит порты 80/443. Локальный (native) nginx под не-root
+  падал с `bind() ... (13: Permission denied)` (так упал CI на раннере
+  `runner`). Решение: в workflow шаг `sudo sysctl -w
+  net.ipv4.ip_unprivileged_port_start=0`; скрипт сам проверяет, может ли
+  пользователь биндить порт 80, и иначе уходит в Docker или печатает подсказку.
+  Ещё скрипт передаёт `nginx -t -e <tmp>/error.log`, чтобы не открывался
+  встроенный `/var/log/nginx/error.log`. Проверено в ubuntu:24.04 под не-root
+  с nginx-light 1.24: до фикса падает, после - все три варианта проходят.
 
 ## TLS
 
